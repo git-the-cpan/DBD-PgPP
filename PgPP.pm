@@ -20,7 +20,7 @@ use DBI;
 use Carp;
 use vars qw($VERSION $err $errstr $state $drh);
 
-$VERSION = '0.04';
+$VERSION = '0.05';
 $err = 0;
 $errstr = '';
 $state = undef;
@@ -130,12 +130,6 @@ sub connect
 			debug    => $data_source_info->{debug},
 		);
 		$dbh->STORE(pgpp_connection => $pgsql);
-#		$dbh->STORE(thread_id => $mysql->{server_thread_id});
-
-		if (! $attrhash->{AutoCommit}) {
-			my $pgsth = $pgsql->prepare('BEGIN');
-			$pgsth->execute();
-		}
 	};
 	if ($@) {
 		$dbh->DBI::set_err(1, $@);
@@ -159,6 +153,54 @@ package DBD::PgPP::db;
 
 $DBD::PgPP::db::imp_data_size = 0;
 use strict;
+
+
+# We need to implement ->quote, because otherwise we get the default DBI
+# one, which ignores backslashes.  The DBD::Pg implementation doubles all
+# backslashes and apostrophes; this version backslash-protects all of them.
+# XXX: What about null characters, or byte sequences that don't form valid
+# characters in the relevant encoding?
+# XXX: What about the mysterious additional '$data_type' argument?
+sub quote
+{
+    my ($dbh, $s) = @_;
+
+    if (!defined $s) {
+        # Yes, _every_ DBD that needs its own quote method has to check for
+        # nulls separately.
+        return 'NULL';
+    }
+    elsif (ref $s ne 'ARRAY') { # or not a ref at all
+        # It's best to always put quotes round it, even if it looks like a
+        # simple integer.  Otherwise you can't compare the result of quoting
+        # Perl numeric zero to a boolean column.  (You can't _reliably_
+        # compare a Perl scalar to a boolean column anyway, because there
+        # are six Postgres syntaxes for TRUE, and six for FALSE, and
+        # everything else is an error -- but that's another story, and at
+        # least if you quote '0' it looks false to Postgres.  Sigh.  I have
+        # some plans for a pure-Perl DBD which understands the 7.4 protocol,
+        # and can therefore fix up bools in _both_ directions.)
+        $s =~ s/(?=[\\\'])/\\/g;
+        return "'$s'";
+    }
+    else {
+        # It's an array ref, so produce an 'IN'-style list.  This is a bit
+        # sneaky; DBI specifically guarantees that nothing like this
+        # happens.  But it seems obviously the right thing to me, and
+        # something I actually need for an application, so I'm doing it
+        # anyway.  If you were relying on passing an array-ref and getting
+        # back its stringified form, tough -- stringify it yourself first.
+
+        # Empty parens are forbidden, so special-case an empty array.  This
+        # has the desired effect -- it's a list that nothing is ever IN.
+        return '(NULL)' if !@$s;
+
+        # Explicitly stringify each item, so that we never try to produce a
+        # nested list.  But don't stringify NULLs.
+        my $list = join ', ', map { $dbh->quote($_ && "$_") } @$s;
+        return "($list)";
+    }
+}
 
 
 sub prepare
@@ -234,13 +276,44 @@ sub FETCH
 sub STORE
 {
 	my $dbh = shift;
-	my ($key, $value) = @_;
+	my ($key, $new) = @_;
 
-	if ($key =~ /^(?:pgpp_.*|AutoCommit)$/) {
-		$dbh->{$key} = $value;
+	if ($key eq 'AutoCommit') {
+		my $old = $dbh->{$key};
+		my $never_set = !$dbh->{pgpp_ever_set_autocommit};
+
+		# This logic is stolen from DBD::Pg
+		if (!$old && $new && $never_set) {
+			# Do nothing; fall through
+		}
+		elsif (!$old && $new) {
+			# Turning it on: commit
+			# XXX: Avoid this if no uncommitted changes.
+			# XXX: Desirable?  See dbi-dev archives.
+			# XXX: Handle errors.
+			my $st = $dbh->{pgpp_connection}->prepare('COMMIT');
+			$st->execute;
+		}
+		elsif ($old && !$new   ||  !$old && !$new && $never_set) {
+			# Turning it off, or initializing it to off at
+			# connection time: begin a new transaction
+			# XXX: Handle errors.
+			my $st = $dbh->{pgpp_connection}->prepare('BEGIN');
+			$st->execute;
+		}
+
+		$dbh->{pgpp_ever_set_autocommit} = 1;
+		$dbh->{$key} = $new;
+
 		return 1;
 	}
-	return $dbh->SUPER::STORE($key, $value);
+
+	if ($key =~ /^pgpp_/) {
+		$dbh->{$key} = $new;
+		return 1;
+	}
+
+	return $dbh->SUPER::STORE($key, $new);
 }
 
 
@@ -372,6 +445,12 @@ sub STORE
 		$dbh->{$key} = $value;
 		return 1;
 	}
+	elsif ($key eq 'NUM_OF_FIELDS') {
+		# Don't set this twice; DBI doesn't seem to like it.
+		# XXX: why not?
+		my $curr = $dbh->FETCH($key);
+		return 1 if $curr && $curr == $value;
+	}
 	return $dbh->SUPER::STORE($key, $value);
 }
 
@@ -390,7 +469,7 @@ use IO::Socket;
 use Carp;
 use vars qw($VERSION $DEBUG);
 use strict;
-$VERSION = '0.04';
+$VERSION = '0.05';
 
 use constant DEFAULT_UNIX_SOCKET => '/tmp';
 use constant DEFAULT_PORT_NUMBER => 5432;
@@ -478,7 +557,7 @@ sub _connect {
 		$pgsql = IO::Socket::UNIX->new(
 			Type => SOCK_STREAM,
 			Peer => $path,
-		) or croak "Couldn't connect to $self->{path}/.s.PGSQL.$self->{port}: $@";	
+		) or croak "Couldn't connect to $self->{path}/.s.PGSQL.$self->{port}: $@";
 	}
 	$pgsql->autoflush(1);
 	$self->{'socket'} = $pgsql;
@@ -525,7 +604,7 @@ sub _dump_packet {
 		print '   ' x (16 - length $chunk);
 		print '  ';
 		print join '', map {
-			sprintf '%s', (/[\w\d\*\,\?\%\=\'\;\(\)\.-]/) ? $_ : '.'
+			sprintf '%s', (/[[:graph:] ]/) ? $_ : '.'
 		} split //, $chunk;
 		print "\n";
 	}
@@ -625,7 +704,7 @@ sub execute {
 		my $row_info = $stream->each();
 		if ($row_info->is_error()) {
 			$self->_to_end_of_response($stream);
-			croak $packet->get_message();
+			croak $row_info->get_message();
 		}
 		$row_info->compute($pgsql);
 		$self->{stream} = DBD::PgPP::ReadOnlyPacketStream->new($handle);
@@ -635,7 +714,7 @@ sub execute {
 			printf "-Recieve %s\n", ref($tmp_packet) if $DBD::PgPP::Protocol::DEBUG;
 			if ($tmp_packet->is_error()) {
 				$self->_to_end_of_response($stream);
-				croak $packet->get_message();
+				croak $tmp_packet->get_message();
 			}
 			$tmp_packet->compute($pgsql);
 			last if $tmp_packet->is_end_of_response;
@@ -916,7 +995,8 @@ sub _each_empty_query_response {
 
 sub _get_byte {
 	my $self = shift;
-	my $length = shift || 1;
+	my $length = shift;
+	$length = 1 unless defined $length;
 
 	$self->_if_short_then_add_buffer($length);
 	my $result = substr $self->{buffer}, 0, $length;
@@ -950,7 +1030,7 @@ sub _get_c_string {
 	while (1) {
 		$length = index $self->{buffer}, "\0";
 		last if $length >= 0;
-		$self->_if_short_then_add_buffer(1);
+		$self->_if_short_then_add_buffer(1 + length $self->{buffer});
 	}
 	my $result = substr $self->{buffer}, 0, $length;
 	$self->{buffer} = substr $self->{buffer}, $length + 1;
@@ -1023,7 +1103,8 @@ sub rewind {
 
 sub _get_byte {
 	my $self = shift;
-	my $length = shift || 1;
+	my $length = shift;
+	$length = 1 unless defined $length;
 
 	$self->_if_short_then_add_buffer($length);
 	my $result = substr $self->{buffer}, $self->{position}, $length;
@@ -1056,7 +1137,7 @@ sub _get_c_string {
 	while (1) {
 		$length = index($self->{buffer}, "\0", $self->{position}) - $self->{position};
 		last if $length >= 0;
-		$self->_if_short_then_add_buffer(1);
+		$self->_if_short_then_add_buffer(1 + length $self->{buffer});
 	}
 	my $result = substr $self->{buffer}, $self->{position}, $length;
 	$self->{position} += $length + 1;
@@ -1086,7 +1167,7 @@ use strict;
 sub new {
 	my $class = shift;
 	bless {
-	}, $class; 
+	}, $class;
 }
 
 
@@ -1109,7 +1190,7 @@ use base 'DBD::PgPP::Response';
 
 
 package DBD::PgPP::AuthenticationKerberosV4;
-use base 'DBD::PgPP::Response'; 
+use base 'DBD::PgPP::Response';
 use Carp;
 use strict;
 
@@ -1120,7 +1201,7 @@ sub compute {
 
 
 package DBD::PgPP::AuthenticationKerberosV5;
-use base 'DBD::PgPP::Response'; 
+use base 'DBD::PgPP::Response';
 use Carp;
 use strict;
 
@@ -1130,7 +1211,7 @@ sub compute {
 
 
 package DBD::PgPP::AuthenticationCleartextPassword;
-use base 'DBD::PgPP::Response'; 
+use base 'DBD::PgPP::Response';
 
 sub compute {
 	my $self = shift;
@@ -1145,13 +1226,13 @@ sub compute {
 
 
 package DBD::PgPP::AuthenticationCryptPassword;
-use base 'DBD::PgPP::Response'; 
+use base 'DBD::PgPP::Response';
 use Carp;
 
 sub new {
 	my $class = shift;
 	my $self = $class->SUPER::new();
-	$self->{salt} = shift;	
+	$self->{salt} = shift;
 	$self;
 }
 
@@ -1427,18 +1508,24 @@ sub compute
 	my $fields_length = scalar @{$pgsql->{row_description}};
 
 	my $bitmap_length = $self->_get_length_of_null_bitmap($fields_length);
-	my $bitmap = unpack 'C*', $stream->_get_byte($bitmap_length);
+	my $non_null = unpack 'B*', $stream->_get_byte($bitmap_length);
 	my @result;
-	my $shift = 1;
-	for my $i (1..$fields_length) {
-		if ($self->_is_not_null($bitmap, $bitmap_length, $i)) {
+	for my $i (0 .. $fields_length - 1) {
+		my $value;
+		if (substr $non_null, $i, 1) {
 			my $length = $stream->_get_int32();
-			my $value = $stream->_get_byte($length - 4);
-			push @result, $value;
-			next;
+			$value = $stream->_get_byte($length - 4);
+			my $type_oid = $pgsql->{row_description}[$i]{type};
+			if ($type_oid == 16) { # bool
+				$value = ($value eq 'f') ? 0 : 1;
+			}
+			elsif ($type_oid == 17) { # bytea
+				$value =~ s{\\(\\|[0-7]{3})}{
+					$1 eq '\\' ? '\\' : chr oct $1
+				}ge;
+			}
 		}
-		push @result, undef;
-		next;
+		push @result, $value;
 	}
 	$self->{result} = \@result;
 }
@@ -1451,16 +1538,6 @@ sub _get_length_of_null_bitmap {
 	my $length = $number / 8;
 	++$length if $number % 8;
 	return $length;
-}
-
-
-sub _is_not_null {
-	my $self = shift;
-	my $bitmap = shift || 0;
-	my $length = shift || 0;
-	my $index = shift || 0;
-
-	($bitmap >> (($length * 8) - $index)) & 0x01;
 }
 
 
@@ -1594,7 +1671,7 @@ sub hexdigest {
 		for (0..63) {
 			#no warnings;
 			local($^W) = 0;
-			$a = _m($b + 
+			$a = _m($b +
 				_l($A[4 + 4 * ($_ >> 4) + $_ % 4],
 					_m(&{(
 						sub {
@@ -1711,7 +1788,7 @@ with MacPerl5.6.1r1 built for PowerPC
 =item * Mac OS X
 
 with perl v5.6.0 built for darwin
- 
+
 =item * Windows2000
 
 with ActivePerl5.6.1 build631.
@@ -1777,11 +1854,11 @@ L<DBI>, L<http://developer.postgresql.org/docs/postgres/protocol.html>
 
 =head1 AUTHOR
 
-Hiroyuki OYAMA E<lt>oyama@crayfish.co.jpE<gt>
+Hiroyuki OYAMA E<lt>oyama@module.jpE<gt>
 
 =head1 COPYRIGHT AND LICENCE
 
-Copyright (C) 2002 Hiroyuki OYAMA. Japan. All rights reserved.
+Copyright (C) 2004 Hiroyuki OYAMA. Japan. All rights reserved.
 
 This library is free software; you can redistribute it and/or modify it under the same terms as Perl itself.
 
